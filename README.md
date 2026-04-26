@@ -81,7 +81,22 @@ Your Phone (WhatsApp/Telegram)
 
 Before deploying, go to **AWS Console > Bedrock > Model access** and enable the models you want. The default is Amazon Nova Lite. This step is not in the original guide but the deployment will silently fail without it - the stack completes successfully but the AI never responds.
 
-### Step 2: Deploy via CloudFormation
+### Step 2: Create an EC2 Key Pair
+
+The key pair gives you emergency SSH access to the instance if SSM is ever unavailable. It is optional but recommended.
+
+1. Go to **AWS Console > EC2**
+2. In the left sidebar, scroll down to **Network & Security > Key Pairs**
+3. Click **Create key pair** (orange button, top right)
+4. Fill in the details:
+   - **Name:** anything you'll remember, e.g. `openclaw-key` (no spaces, case-sensitive - you'll need to type this exactly later)
+   - **Key pair type:** RSA
+   - **Private key file format:** .pem
+5. Click **Create key pair**
+
+A `.pem` file downloads automatically. Keep it somewhere safe - it cannot be downloaded again. If you lose it, you will need to create a new key pair.
+
+### Step 3: Deploy via CloudFormation
 
 Use the template in [`cloudformation/openclaw-bedrock.yaml`](cloudformation/openclaw-bedrock.yaml) or from [aws-samples/sample-OpenClaw-on-AWS-with-Bedrock](https://github.com/aws-samples/sample-OpenClaw-on-AWS-with-Bedrock).
 
@@ -92,6 +107,7 @@ Key parameters to configure:
 | OpenClawModel | `global.amazon.nova-2-lite-v1:0` | Cheapest, good for everyday tasks |
 | OpenClawVersion | `2026.3.24` | More stable, no extra approval needed |
 | InstanceType | `t4g.small` | ARM64 Graviton, cheapest viable option |
+| KeyPairName | `openclaw-key` | Must match the key pair name from Step 2 exactly - it is case-sensitive |
 | CreateVPCEndpoints | `false` | Saves ~$29/month for sandbox use |
 | EnableDataProtection | `false` | Set to `true` for production |
 
@@ -99,7 +115,7 @@ Scroll to the bottom, check **"I acknowledge that AWS CloudFormation might creat
 
 Wait ~8-10 minutes for `CREATE_COMPLETE`.
 
-### Step 3: Fix the Bonjour Plugin Bug
+### Step 4: Fix the Bonjour Plugin Bug
 
 **Do this before anything else.** This is a critical issue when running OpenClaw on AWS that the original guide does not mention.
 
@@ -149,7 +165,7 @@ ss -tlnp | grep 18789
 
 You should see port 18789 in LISTEN state. If it is there after 15 seconds, the fix worked.
 
-### Step 4: Access the Dashboard
+### Step 5: Access the Dashboard
 
 The CloudFormation Outputs tab gives you everything you need under Steps 1-4.
 
@@ -176,7 +192,7 @@ aws ssm get-parameter \
   --output text
 ```
 
-### Step 5: Connect a Messaging Channel
+### Step 6: Connect a Messaging Channel
 
 Once the dashboard is up, go to **Channels > Add Channel** and connect Telegram, WhatsApp, Discord, or Slack. The assistant will walk you through setup on first conversation.
 
@@ -217,7 +233,7 @@ If you see this repeating:
 openclaw-gateway.service: Main process exited, code=exited, status=1/FAILURE
 ```
 
-That is the bonjour crash. Apply the fix in Step 3 above.
+That is the bonjour crash. Apply the fix in Step 4 above.
 
 **Root cause:** Bonjour (mDNS) requires multicast networking for local device discovery. AWS VPC does not support multicast. The plugin gets stuck in a probing loop, gives up, and throws an unhandled rejection that kills the entire Node.js process. It restarts via systemd and crashes again on a ~45 second cycle indefinitely.
 
@@ -308,12 +324,13 @@ OpenClaw shows an update available banner when a newer version exists. Do not cl
 ## Things the Original Guide Doesn't Tell You
 
 1. **Enable Bedrock model access first** - the deployment completes successfully but the AI silently fails to respond
-2. **Disable the bonjour plugin immediately** - it will crash your gateway every 45 seconds in any cloud environment
-3. **Don't click the update banner** - updating in-place can break the config the CloudFormation template set up
-4. **Bedrock has daily token quotas on new accounts** - test Bedrock directly with `aws bedrock-runtime invoke-model` to confirm whether it is a quota issue
-5. **In some regions (e.g. Tokyo), bare model IDs are rejected** - use inference profile IDs with a regional prefix and check with `aws bedrock list-inference-profiles`
-6. **The gateway token lives in SSM Parameter Store** at `/openclaw/<stack-name>/gateway-token` - you do not need to save the dashboard URL separately
-7. **Stopping the EC2 instance is safe** - config persists on the separate EBS data volume
+2. **The key pair name is case-sensitive** - if it doesn't match exactly what you typed in EC2, CloudFormation will fail
+3. **Disable the bonjour plugin immediately** - it will crash your gateway every 45 seconds in any cloud environment
+4. **Don't click the update banner** - updating in-place can break the config the CloudFormation template set up
+5. **Bedrock has daily token quotas on new accounts** - test Bedrock directly with `aws bedrock-runtime invoke-model` to confirm whether it is a quota issue
+6. **In some regions (e.g. Tokyo), bare model IDs are rejected** - use inference profile IDs with a regional prefix and check with `aws bedrock list-inference-profiles`
+7. **The gateway token lives in SSM Parameter Store** at `/openclaw/<stack-name>/gateway-token` - you do not need to save the dashboard URL separately
+8. **Stopping the EC2 instance is safe** - config persists on the separate EBS data volume
 
 ---
 
