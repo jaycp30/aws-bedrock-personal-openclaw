@@ -94,7 +94,7 @@ The key pair gives you emergency SSH access to the instance if SSM is ever unava
    - **Private key file format:** .pem
 5. Click **Create key pair**
 
-A `.pem` file downloads automatically. Keep it somewhere safe - it cannot be downloaded again. If you lose it, you will need to create a new key pair.
+A `.pem` file downloads automatically. Keep it somewhere safe, e.g. Parameter Store.
 
 ### Step 3: Deploy via CloudFormation
 
