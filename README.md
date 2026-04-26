@@ -1,490 +1,327 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: 'OpenClaw - AWS Native Deployment (Bedrock + SSM + VPC Endpoints)'
+# OpenClaw on AWS with Amazon Bedrock
 
-Metadata:
-  cfn-lint:
-    config:
-      ignore_checks:
-        - E6101
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label:
-          default: "Basic Configuration"
-        Parameters:
-          - OpenClawModel
-          - OpenClawVersion
-          - InstanceType
-          - KeyPairName
-      - Label:
-          default: "Network Configuration"
-        Parameters:
-          - CreateVPCEndpoints
-          - AllowedSSHCIDR
+A self-hosted personal AI assistant running on AWS EC2, powered by Amazon Bedrock - no API keys, no local compute, no laptop dependency.
 
-Parameters:
-  OpenClawModel:
-    Type: String
-    Default: "global.amazon.nova-2-lite-v1:0"
-    Description: "Bedrock model ID - Nova 2 Lite offers best price-performance for everyday tasks"
-    AllowedValues:
-      - "global.amazon.nova-2-lite-v1:0"
-      - "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      - "us.amazon.nova-pro-v1:0"
-      - "global.anthropic.claude-opus-4-6-v1"
-      - "global.anthropic.claude-opus-4-5-20251101-v1:0"
-      - "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-      - "global.anthropic.claude-sonnet-4-20250514-v1:0"
-      - "us.deepseek.r1-v1:0"
-      - "us.meta.llama3-3-70b-instruct-v1:0"
-      - "moonshotai.kimi-k2.5"
+Based on the guide by [Jon Bonso / The Cloud Dojo](https://www.linkedin.com/pulse/stop-running-openclaw-your-laptop-how-i-built-secure-personal-bonso-thyyc/).
 
-  InstanceType:
-    Type: String
-    Default: "c7g.large"
-    Description: "Graviton (ARM) recommended for 20-40% better price-performance."
-    AllowedValues:
-      - "t4g.small"
-      - "t4g.medium"
-      - "t4g.large"
-      - "t4g.xlarge"
-      - "c6g.large"
-      - "c6g.xlarge"
-      - "c7g.large"
-      - "c7g.xlarge"
-      - "t3.small"
-      - "t3.medium"
-      - "t3.large"
-      - "c5.xlarge"
+---
 
-  KeyPairName:
-    Type: String
-    Default: "none"
-    Description: "EC2 key pair for emergency SSH access (optional)"
+## What This Is
 
-  AllowedSSHCIDR:
-    Type: String
-    Default: ""
-    Description: "CIDR for SSH access (optional)"
+[OpenClaw](https://openclaw.ai) is an open-source AI agent framework. Instead of just chatting with an AI, it can take actions - respond to messages on WhatsApp/Telegram/Discord, run scheduled tasks, maintain memory across conversations, and use tools and skills.
 
-  CreateVPCEndpoints:
-    Type: String
-    Default: "true"
-    Description: "Create VPC endpoints for private network access to Bedrock and SSM"
-    AllowedValues:
-      - "true"
-      - "false"
+The problem with running it locally: it needs to be on 24/7, has full access to your machine, and dies when your laptop sleeps or your Wi-Fi drops.
 
-  EnableSandbox:
-    Type: String
-    Default: "true"
-    Description: "Install Docker for sandboxed execution"
+This deployment moves it to AWS, where it runs continuously on EC2 and calls Amazon Bedrock for its AI model instead of managing separate API keys per provider.
 
-  OpenClawVersion:
-    Type: String
-    Default: "2026.3.24"
-    AllowedValues:
-      - "2026.3.24"
-      - "2026.4.5"
-      - "latest"
-    Description: "OpenClaw version."
+---
 
-  EnableDataProtection:
-    Type: String
-    Default: "false"
-    Description: "Retain data volume when stack is deleted"
-    AllowedValues:
-      - "true"
-      - "false"
+## Repository Structure
 
-Conditions:
-  CreateEndpoints: !Equals [!Ref CreateVPCEndpoints, "true"]
-  HasKeyPair: !Not [!Equals [!Ref KeyPairName, "none"]]
-  AllowSSH: !And
-    - !Not [!Equals [!Ref AllowedSSHCIDR, ""]]
-    - !Not [!Equals [!Ref KeyPairName, "none"]]
-  IsUsEast1: !Equals [ !Ref "AWS::Region", "us-east-1" ]
-  IsUsEast2: !Equals [ !Ref "AWS::Region", "us-east-2" ]
-  IsUsWest2: !Equals [ !Ref "AWS::Region", "us-west-2" ]
-  IsApSoutheast3: !Equals [ !Ref "AWS::Region", "ap-southeast-3" ]
-  IsApSouth1: !Equals [ !Ref "AWS::Region", "ap-south-1" ]
-  IsApNortheast1: !Equals [ !Ref "AWS::Region", "ap-northeast-1" ]
-  IsEuCentral1: !Equals [ !Ref "AWS::Region", "eu-central-1" ]
-  IsEuWest1: !Equals [ !Ref "AWS::Region", "eu-west-1" ]
-  IsEuWest2: !Equals [ !Ref "AWS::Region", "eu-west-2" ]
-  IsEuSouth1: !Equals [ !Ref "AWS::Region", "eu-south-1" ]
-  IsEuNorth1: !Equals [ !Ref "AWS::Region", "eu-north-1" ]
-  IsSaEast1: !Equals [ !Ref "AWS::Region", "sa-east-1" ]
-  IsMantleSupportedRegion: !Or
-    - !Or
-      - Condition: IsUsEast1
-      - Condition: IsUsEast2
-      - Condition: IsUsWest2
-      - Condition: IsApSoutheast3
-      - Condition: IsApSouth1
-      - Condition: IsApNortheast1
-    - !Or
-      - Condition: IsEuCentral1
-      - Condition: IsEuWest1
-      - Condition: IsEuWest2
-      - Condition: IsEuSouth1
-      - Condition: IsEuNorth1
-      - Condition: IsSaEast1
-  CreateMantleEndpoint: !And [ Condition: CreateEndpoints, Condition: IsMantleSupportedRegion ]
-  EnableDocker: !Equals [!Ref EnableSandbox, "true"]
-  ProtectData: !Equals [!Ref EnableDataProtection, "true"]
-  DeleteData: !Not [!Equals [!Ref EnableDataProtection, "true"]]
+```
+.
+├── README.md
+└── cloudformation/
+    └── openclaw-bedrock.yaml
+```
 
-Mappings:
-  ArchitectureMap:
-    t3.small: { Arch: "amd64" }
-    t3.medium: { Arch: "amd64" }
-    t3.large: { Arch: "amd64" }
-    t3.xlarge: { Arch: "amd64" }
-    c5.xlarge: { Arch: "amd64" }
-    t4g.small: { Arch: "arm64" }
-    t4g.medium: { Arch: "arm64" }
-    t4g.large: { Arch: "arm64" }
-    t4g.xlarge: { Arch: "arm64" }
-    c6g.large: { Arch: "arm64" }
-    c6g.xlarge: { Arch: "arm64" }
-    c7g.large: { Arch: "arm64" }
-    c7g.xlarge: { Arch: "arm64" }
+---
 
-Resources:
-  OpenClawWaitHandle:
-    Type: AWS::CloudFormation::WaitConditionHandle
+## Architecture
 
-  OpenClawWaitCondition:
-    Type: AWS::CloudFormation::WaitCondition
-    DependsOn: OpenClawInstance
-    Properties:
-      Handle: !Ref OpenClawWaitHandle
-      Timeout: '900'
-      Count: 1
+```
+Your Phone (WhatsApp/Telegram)
+        |
+        v
+  Messaging Platform
+        |
+        v
+  OpenClaw Gateway (EC2 - Ubuntu 24.04, Graviton ARM64)
+        |
+        v
+  Amazon Bedrock (Nova Lite / Nova Micro)
+        |
+        v
+  AI Response
+```
 
-  OpenClawVPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: "10.0.0.0/16"
-      EnableDnsHostnames: true
-      EnableDnsSupport: true
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-vpc"
+**Key components:**
 
-  OpenClawInternetGateway:
-    Type: AWS::EC2::InternetGateway
+- **EC2 Instance** - runs the OpenClaw gateway process (t4g.small, ARM64/Graviton)
+- **Amazon Bedrock** - provides the AI model via unified API, no separate API keys needed
+- **IAM Role** - EC2 authenticates to Bedrock via instance profile, no credentials stored anywhere
+- **EBS Data Volume** - 30GB encrypted volume for OpenClaw config and data, survives instance stop/start
+- **SSM Session Manager** - access to the instance and port forwarding, no SSH port open
+- **VPC** - dedicated network with optional private endpoints so traffic never leaves AWS
 
-  AttachGateway:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      InternetGatewayId: !Ref OpenClawInternetGateway
+---
 
-  PublicSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      CidrBlock: "10.0.1.0/24"
-      MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-public-subnet"
+## Why Bedrock Instead of Direct API Keys
 
-  PrivateSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      CidrBlock: "10.0.2.0/24"
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-private-subnet-az1"
+| Feature | Standalone OpenClaw | OpenClaw + Bedrock |
+|---|---|---|
+| Setup | Manual CLI + Docker | 1-click CloudFormation |
+| AI Model Access | Separate API keys per provider | Single unified API |
+| Billing | Multiple bills (OpenAI, Anthropic, etc.) | Single AWS bill |
+| Security | API keys in local files | IAM Roles, no keys stored |
+| Networking | Public internet | Private VPC |
+| Reliability | Depends on laptop uptime | 99.99% AWS uptime |
 
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Condition: CreateEndpoints
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      CidrBlock: "10.0.3.0/24"
-      AvailabilityZone: !Select [1, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-private-subnet-az2"
+---
 
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref OpenClawVPC
+## Deployment
 
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: AttachGateway
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: "0.0.0.0/0"
-      GatewayId: !Ref OpenClawInternetGateway
+### Prerequisites
 
-  SubnetRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
+- AWS account with Bedrock model access enabled
+- AWS CLI installed and configured locally
+- SSM Session Manager plugin installed locally
 
-  VPCEndpointSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Condition: CreateEndpoints
-    Properties:
-      GroupDescription: "Security group for VPC endpoints"
-      VpcId: !Ref OpenClawVPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          SourceSecurityGroupId: !Ref OpenClawSecurityGroup
+### Step 1: Enable Bedrock Model Access
 
-  BedrockRuntimeVPCEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: CreateEndpoints
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnet
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+Before deploying, go to **AWS Console > Bedrock > Model access** and enable the models you want. The default is Amazon Nova Lite. This step is not in the original guide but the deployment will silently fail without it - the stack completes successfully but the AI never responds.
 
-  BedrockMantleVPCEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: CreateMantleEndpoint
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-mantle'
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnet
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+### Step 2: Deploy via CloudFormation
 
-  SSMVPCEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: CreateEndpoints
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnet
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+Use the template in [`cloudformation/openclaw-bedrock.yaml`](cloudformation/openclaw-bedrock.yaml) or from [aws-samples/sample-OpenClaw-on-AWS-with-Bedrock](https://github.com/aws-samples/sample-OpenClaw-on-AWS-with-Bedrock).
 
-  SSMMessagesVPCEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: CreateEndpoints
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnet
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+Key parameters to configure:
 
-  EC2MessagesVPCEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: CreateEndpoints
-    Properties:
-      VpcId: !Ref OpenClawVPC
-      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnet
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+| Parameter | Recommended (Sandbox) | Notes |
+|---|---|---|
+| OpenClawModel | `global.amazon.nova-2-lite-v1:0` | Cheapest, good for everyday tasks |
+| OpenClawVersion | `2026.3.24` | More stable, no extra approval needed |
+| InstanceType | `t4g.small` | ARM64 Graviton, cheapest viable option |
+| CreateVPCEndpoints | `false` | Saves ~$29/month for sandbox use |
+| EnableDataProtection | `false` | Set to `true` for production |
 
-  OpenClawInstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ec2.amazonaws.com
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
-        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
-      Policies:
-        - PolicyName: BedrockAccessPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'bedrock:InvokeModel'
-                  - 'bedrock:InvokeModelWithResponseStream'
-                  - 'bedrock:ListFoundationModels'
-                  - 'bedrock:GetFoundationModel'
-                  - 'bedrock:ListInferenceProfiles'
-                Resource: '*'
-        - PolicyName: BedrockMantleAccessPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'bedrock-mantle:*'
-                Resource: '*'
-        - PolicyName: SSMParameterPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'ssm:PutParameter'
-                  - 'ssm:GetParameter'
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/openclaw/${AWS::StackName}/*'
-        - PolicyName: EC2DescribeTagsPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'ec2:DescribeTags'
-                Resource: '*'
-        - PolicyName: CloudFormationDescribePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'cloudformation:DescribeStackResource'
-                  - 'cloudformation:SignalResource'
-                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+Scroll to the bottom, check **"I acknowledge that AWS CloudFormation might create IAM resources"**, and click **Create stack**.
 
-  OpenClawInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      Roles:
-        - !Ref OpenClawInstanceRole
+Wait ~8-10 minutes for `CREATE_COMPLETE`.
 
-  OpenClawSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: "OpenClaw instance security group"
-      VpcId: !Ref OpenClawVPC
-      SecurityGroupIngress:
-        - !If
-          - AllowSSH
-          - IpProtocol: tcp
-            FromPort: 22
-            ToPort: 22
-            CidrIp: !Ref AllowedSSHCIDR
-            Description: "SSH access (fallback)"
-          - !Ref AWS::NoValue
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: "0.0.0.0/0"
+### Step 3: Fix the Bonjour Plugin Bug
 
-  OpenClawDataVolumeRetained:
-    Type: AWS::EC2::Volume
-    Condition: ProtectData
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Size: 30
-      VolumeType: gp3
-      Encrypted: true
+**Do this before anything else.** This is a critical issue when running OpenClaw on AWS that the original guide does not mention.
 
-  OpenClawDataVolumeNotRetained:
-    Type: AWS::EC2::Volume
-    Condition: DeleteData
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
-    Properties:
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Size: 30
-      VolumeType: gp3
-      Encrypted: true
+The `bonjour` plugin handles local network discovery and requires multicast networking, which AWS VPC does not support. It crashes the gateway every ~45 seconds, putting it in a permanent crash loop. The service will appear to start successfully but port 18789 will never stay open long enough to accept connections.
 
-  OpenClawInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Sub
-        - '{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/${Arch}/hvm/ebs-gp3/ami-id}}'
-        - Arch: !FindInMap [ArchitectureMap, !Ref InstanceType, Arch]
-      InstanceType: !Ref InstanceType
-      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
-      IamInstanceProfile: !Ref OpenClawInstanceProfile
-      Volumes:
-        - Device: /dev/sdf
-          VolumeId: !If [ProtectData, !Ref OpenClawDataVolumeRetained, !Ref OpenClawDataVolumeNotRetained]
-      NetworkInterfaces:
-        - AssociatePublicIpAddress: true
-          DeviceIndex: 0
-          GroupSet:
-            - !Ref OpenClawSecurityGroup
-          SubnetId: !Ref PublicSubnet
-      BlockDeviceMappings:
-        - DeviceName: /dev/sda1
-          Ebs:
-            VolumeSize: 30
-            VolumeType: gp3
-            DeleteOnTermination: true
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-instance"
+Connect to the instance via SSM:
 
-Outputs:
-  Step1InstallSSMPlugin:
-    Description: "STEP 1: Install SSM Session Manager Plugin on your local computer"
-    Value: "https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+```bash
+aws ssm start-session --target <instance-id> --region <region>
+sudo su - ubuntu
+```
 
-  Step2PortForwarding:
-    Description: "STEP 2: Run this command on LOCAL computer (keep terminal open)"
-    Value: !Sub |
-      aws ssm start-session --target ${OpenClawInstance} --region ${AWS::Region} --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["18789"],"localPortNumber":["18789"]}'
+Disable the bonjour plugin:
 
-  Step3AccessURL:
-    Description: "STEP 3: Open this URL in browser"
-    Value: !Sub
-      - "http://localhost:18789/?token=${Token}"
-      - Token: !Select [3, !Split ['"', !GetAtt OpenClawWaitCondition.Data]]
+```bash
+# Back up config first
+cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak
 
-  Step4StartChatting:
-    Description: "STEP 4: Start using OpenClaw!"
-    Value: "Connect WhatsApp, Telegram, Discord. See README: https://github.com/aws-samples/sample-OpenClaw-on-AWS-with-Bedrock"
+python3 -c "
+import json
+with open('/home/ubuntu/.openclaw/openclaw.json', 'r') as f:
+    config = json.load(f)
+if 'plugins' not in config:
+    config['plugins'] = {}
+if 'entries' not in config['plugins']:
+    config['plugins']['entries'] = {}
+config['plugins']['entries']['bonjour'] = {'enabled': False}
+with open('/home/ubuntu/.openclaw/openclaw.json', 'w') as f:
+    json.dump(config, f, indent=2)
+print('Done')
+"
+```
 
-  InstanceId:
-    Description: "EC2 Instance ID"
-    Value: !Ref OpenClawInstance
+Verify the change:
 
-  BedrockModel:
-    Description: "Bedrock model in use"
-    Value: !Ref OpenClawModel
+```bash
+cat ~/.openclaw/openclaw.json | python3 -m json.tool | grep -A3 bonjour
+```
 
-  MonthlyCost:
-    Description: "Estimated monthly cost (USD)"
-    Value: !Sub
-      - |
-        EC2 (${InstanceType}): ~$20-40
-        EBS (30GB): ~$2.40
-        VPC Endpoints: ${EndpointCost}
-        Bedrock: Pay-per-use
-        Total: ~${TotalCost}/month
-      - EndpointCost: !If [CreateEndpoints, "~$29 ($0.01/hour x 5 endpoints)", "$0"]
-        TotalCost: !If [CreateEndpoints, "$45-65", "$23-43"]
+Restart the gateway and confirm it stays up:
+
+```bash
+systemctl --user restart openclaw-gateway.service
+sleep 15
+ss -tlnp | grep 18789
+```
+
+You should see port 18789 in LISTEN state. If it is there after 15 seconds, the fix worked.
+
+### Step 4: Access the Dashboard
+
+The CloudFormation Outputs tab gives you everything you need under Steps 1-4.
+
+**Port forwarding** - run on your local machine and keep the terminal open:
+
+```bash
+aws ssm start-session \
+  --target <instance-id> \
+  --region <region> \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["18789"],"localPortNumber":["18789"]}'
+```
+
+Then open the URL from the `Step3AccessURL` output in your browser. The token is already embedded in the URL.
+
+**If you ever lose the token**, retrieve it from SSM Parameter Store:
+
+```bash
+aws ssm get-parameter \
+  --name "/openclaw/<stack-name>/gateway-token" \
+  --with-decryption \
+  --region <region> \
+  --query Parameter.Value \
+  --output text
+```
+
+### Step 5: Connect a Messaging Channel
+
+Once the dashboard is up, go to **Channels > Add Channel** and connect Telegram, WhatsApp, Discord, or Slack. The assistant will walk you through setup on first conversation.
+
+---
+
+## Estimated Cost
+
+| Resource | Monthly Cost |
+|---|---|
+| EC2 t4g.small | ~$12-15 |
+| EBS 30GB gp3 | ~$2.40 |
+| VPC Endpoints (if enabled) | ~$29 |
+| Bedrock | Pay per token used |
+| **Total (no endpoints)** | **~$15-20/month** |
+
+For sandbox use, keep `CreateVPCEndpoints=false`. For production, enable them so your traffic stays private within AWS.
+
+**Tip:** Stop the EC2 instance when not in use. Your config persists on the separate EBS data volume. You only pay for EBS storage while stopped, not compute.
+
+---
+
+## Troubleshooting
+
+### Gateway crash loop - bonjour plugin
+
+**Symptom:** SSM port forwarding connects but immediately shows `Connection to destination port failed`. The gateway appears to start but dies after ~45 seconds.
+
+**Diagnosis:** Check the journal logs:
+
+```bash
+journalctl --user -u openclaw-gateway.service --since "5 minutes ago" --no-pager
+```
+
+If you see this repeating:
+
+```
+[openclaw] Unhandled promise rejection: CIAO PROBING CANCELLED
+openclaw-gateway.service: Main process exited, code=exited, status=1/FAILURE
+```
+
+That is the bonjour crash. Apply the fix in Step 3 above.
+
+**Root cause:** Bonjour (mDNS) requires multicast networking for local device discovery. AWS VPC does not support multicast. The plugin gets stuck in a probing loop, gives up, and throws an unhandled rejection that kills the entire Node.js process. It restarts via systemd and crashes again on a ~45 second cycle indefinitely.
+
+---
+
+### AI not responding in the dashboard
+
+**Symptom:** Messages send successfully in the UI but no response comes back.
+
+**Diagnosis:** Test Bedrock connectivity directly from the EC2 instance:
+
+```bash
+MODEL_ID="global.amazon.nova-2-lite-v1:0"
+aws bedrock-runtime invoke-model \
+  --region <region> \
+  --model-id "$MODEL_ID" \
+  --body '{"messages":[{"role":"user","content":[{"text":"say hello"}]}],"inferenceConfig":{"maxTokens":100}}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/bedrock-test.json && cat /tmp/bedrock-test.json
+```
+
+**If you get `ThrottlingException: Too many tokens per day`:**
+
+You have hit your daily Bedrock token quota. This is common on new AWS accounts with default limits. Options:
+
+1. Wait for the quota to reset (midnight UTC daily)
+2. Request a quota increase: AWS Console > Service Quotas > Amazon Bedrock
+3. Try a different model - first check what inference profiles are available in your region:
+
+```bash
+aws bedrock list-inference-profiles --region <region> \
+  --query "inferenceProfileSummaries[].inferenceProfileId" \
+  --output table
+```
+
+Note: in some regions like Tokyo (`ap-northeast-1`), bare model IDs are rejected. You must use inference profile IDs with a regional prefix (e.g. `apac.amazon.nova-micro-v1:0`).
+
+If an alternative model works, update openclaw.json to use it:
+
+```bash
+python3 -c "
+import json
+with open('/home/ubuntu/.openclaw/openclaw.json', 'r') as f:
+    config = json.load(f)
+config['agents']['defaults']['model']['primary'] = 'amazon-bedrock/<new-model-id>'
+with open('/home/ubuntu/.openclaw/openclaw.json', 'w') as f:
+    json.dump(config, f, indent=2)
+print('Done')
+"
+systemctl --user restart openclaw-gateway.service
+```
+
+**If you get `ResourceNotFoundException` for Claude models:**
+
+Anthropic models on AWS require a one-time use case form per account. Go to AWS Console > Bedrock > Model access, find the Anthropic section, and fill out the form. It typically activates within 15 minutes.
+
+---
+
+### Port forwarding fails after reconnecting
+
+**Symptom:** You previously had the dashboard working, closed the terminal, and now reconnecting gives `Connection to destination port failed`.
+
+**Check if the gateway is still running:**
+
+```bash
+ss -tlnp | grep 18789
+```
+
+If nothing shows, the gateway crashed. Check the logs and restart:
+
+```bash
+journalctl --user -u openclaw-gateway.service -n 30 --no-pager
+systemctl --user restart openclaw-gateway.service
+sleep 15
+ss -tlnp | grep 18789
+```
+
+Then kill and re-run the port forwarding command on your local machine.
+
+---
+
+### Do not click the update banner
+
+OpenClaw shows an update available banner when a newer version exists. Do not click it. The CloudFormation template configures a specific version and the config format differs between versions. Updating in-place breaks the existing configuration. If you want to upgrade, redeploy the stack with the new version parameter instead.
+
+---
+
+## Things the Original Guide Doesn't Tell You
+
+1. **Enable Bedrock model access first** - the deployment completes successfully but the AI silently fails to respond
+2. **Disable the bonjour plugin immediately** - it will crash your gateway every 45 seconds in any cloud environment
+3. **Don't click the update banner** - updating in-place can break the config the CloudFormation template set up
+4. **Bedrock has daily token quotas on new accounts** - test Bedrock directly with `aws bedrock-runtime invoke-model` to confirm whether it is a quota issue
+5. **In some regions (e.g. Tokyo), bare model IDs are rejected** - use inference profile IDs with a regional prefix and check with `aws bedrock list-inference-profiles`
+6. **The gateway token lives in SSM Parameter Store** at `/openclaw/<stack-name>/gateway-token` - you do not need to save the dashboard URL separately
+7. **Stopping the EC2 instance is safe** - config persists on the separate EBS data volume
+
+---
+
+## References
+
+- [OpenClaw Documentation](https://docs.openclaw.ai)
+- [aws-samples/sample-OpenClaw-on-AWS-with-Bedrock](https://github.com/aws-samples/sample-OpenClaw-on-AWS-with-Bedrock)
+- [Original Guide - Jon Bonso / The Cloud Dojo](https://www.linkedin.com/pulse/stop-running-openclaw-your-laptop-how-i-built-secure-personal-bonso-thyyc/)
+- [Amazon Bedrock Documentation](https://docs.aws.amazon.com/bedrock/)
+- [SSM Session Manager Plugin Installation](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+- [Bedrock Inference Profiles](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles.html)
