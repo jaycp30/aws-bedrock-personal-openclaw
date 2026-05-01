@@ -1,0 +1,427 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OpenClaw on AWS Lightsail with Amazon Bedrock.
+  Experimental alternative to the EC2 deployment.
+  Key differences vs EC2: x86 only (no Graviton), IAM user credentials instead of
+  instance profile, SSH port forwarding instead of SSM Session Manager, no VPC
+  private endpoints. Benefits: flat monthly rate, no VPC complexity, simpler setup.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "OpenClaw Configuration"
+        Parameters:
+          - OpenClawModel
+          - OpenClawVersion
+      - Label:
+          default: "Lightsail Instance"
+        Parameters:
+          - BundleId
+          - AvailabilityZone
+          - KeyPairName
+    ParameterLabels:
+      OpenClawModel:
+        default: "Bedrock Model ID"
+      OpenClawVersion:
+        default: "OpenClaw Version"
+      BundleId:
+        default: "Instance Size (Bundle)"
+      AvailabilityZone:
+        default: "Availability Zone"
+      KeyPairName:
+        default: "Lightsail Key Pair Name"
+
+Parameters:
+
+  OpenClawModel:
+    Type: String
+    Default: "ap.amazon.nova-lite-v1:0"
+    Description: >
+      Bedrock inference profile ID. Tokyo (ap-northeast-1) requires the 'ap.' prefix.
+      US regions use 'us.'. For global cross-region inference use 'global.'.
+      Check your region's available profiles:
+      aws bedrock list-inference-profiles --region <region> --query "inferenceProfileSummaries[].inferenceProfileId"
+    AllowedValues:
+      - "global.amazon.nova-2-lite-v1:0"
+      - "ap.amazon.nova-lite-v1:0"
+      - "ap.amazon.nova-micro-v1:0"
+      - "ap.amazon.nova-pro-v1:0"
+      - "us.amazon.nova-lite-v1:0"
+      - "us.amazon.nova-micro-v1:0"
+      - "us.amazon.nova-pro-v1:0"
+      - "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+      - "global.anthropic.claude-sonnet-4-20250514-v1:0"
+
+  OpenClawVersion:
+    Type: String
+    Default: "2026.3.24"
+    AllowedValues:
+      - "2026.3.24"
+      - "2026.4.5"
+      - "latest"
+    Description: "OpenClaw version. 2026.3.24 is stable and tested."
+
+  BundleId:
+    Type: String
+    Default: "small_3_0"
+    Description: >
+      Lightsail instance size. small_3_0 ($10/mo, 2GB RAM, 60GB SSD) is the
+      recommended minimum. micro_3_0 ($5/mo, 1GB) may work for light use but
+      can struggle under load. medium_3_0 ($20/mo, 4GB) for heavier workloads.
+    AllowedValues:
+      - "micro_3_0"
+      - "small_3_0"
+      - "medium_3_0"
+
+  AvailabilityZone:
+    Type: String
+    Default: "ap-northeast-1a"
+    Description: >
+      Must match your deployment region. Tokyo = ap-northeast-1a, Singapore = ap-southeast-1a,
+      US East = us-east-1a, US West = us-west-2a.
+    AllowedValues:
+      - "ap-northeast-1a"
+      - "ap-northeast-1c"
+      - "ap-northeast-1d"
+      - "ap-southeast-1a"
+      - "ap-southeast-1b"
+      - "us-east-1a"
+      - "us-east-1b"
+      - "us-west-2a"
+      - "us-west-2b"
+      - "eu-west-1a"
+      - "eu-west-1b"
+
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: >
+      Name of an existing Lightsail key pair for SSH access. Create one in the
+      Lightsail console under Account > SSH keys before deploying.
+      Leave empty to skip (you can still use browser-based SSH in the Lightsail console).
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM: Bedrock access via IAM user + access keys
+  #
+  # Unlike the EC2 version (which uses an IAM instance profile), Lightsail
+  # does not support attaching instance profiles via CloudFormation. We create
+  # an IAM user with scoped permissions instead. Credentials are embedded in
+  # the instance via UserData and the gateway token is written to SSM.
+  # ---------------------------------------------------------------------------
+
+  OpenClawBedrockUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-openclaw-svc"
+      Tags:
+        - Key: Project
+          Value: OpenClaw
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  OpenClawBedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-openclaw-policy"
+      Description: "OpenClaw Lightsail - Bedrock invoke and SSM token write"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+          - Sid: SSMGatewayToken
+            Effect: Allow
+            Action:
+              - ssm:PutParameter
+              - ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/openclaw/${AWS::StackName}/*"
+      Users:
+        - !Ref OpenClawBedrockUser
+
+  OpenClawAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref OpenClawBedrockUser
+
+  # ---------------------------------------------------------------------------
+  # SSM Parameter: Gateway token placeholder
+  # The UserData script overwrites this with the real token after OpenClaw starts.
+  # ---------------------------------------------------------------------------
+
+  GatewayTokenParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/openclaw/${AWS::StackName}/gateway-token"
+      Type: String
+      Value: "initializing"
+      Description: !Sub "OpenClaw gateway token - written by instance on first boot (stack: ${AWS::StackName})"
+
+  # ---------------------------------------------------------------------------
+  # Lightsail Instance
+  # ---------------------------------------------------------------------------
+
+  OpenClawInstance:
+    Type: AWS::Lightsail::Instance
+    DependsOn:
+      - OpenClawBedrockPolicy
+      - GatewayTokenParam
+    Properties:
+      InstanceName: !Sub "${AWS::StackName}-openclaw"
+      BlueprintId: ubuntu_22_04
+      BundleId: !Ref BundleId
+      AvailabilityZone: !Ref AvailabilityZone
+      KeyPairName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Project
+          Value: OpenClaw
+        - Key: Stack
+          Value: !Ref AWS::StackName
+      # Port 18789 is intentionally not listed here (not open publicly).
+      # Access the dashboard via SSH port forwarding only.
+      Networking:
+        Ports:
+          - FromPort: 22
+            ToPort: 22
+            Protocol: tcp
+
+      # ------------------------------------------------------------------
+      # UserData
+      #
+      # CloudFormation's !Sub processes ${...} substitutions BEFORE the
+      # script runs. By the time bash sees this script, all CF variables
+      # are already replaced with literal values.
+      #
+      # Bash variables inside the script use ${!VAR} in the CF template,
+      # which CF converts to ${VAR} for bash to expand at runtime.
+      # ------------------------------------------------------------------
+      UserData: !Sub |
+        #!/bin/bash
+        set -e
+        exec > /var/log/openclaw-setup.log 2>&1
+        echo "=== OpenClaw Lightsail Setup ==="
+        echo "Started: $(date)"
+        echo "Region: ${AWS::Region} | Version: ${OpenClawVersion} | Model: ${OpenClawModel}"
+
+        # System update
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get upgrade -y -q
+
+        # Install Node.js 20 LTS (required for OpenClaw npm package)
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        apt-get install -y nodejs
+        node --version
+        npm --version
+
+        # Install Docker (for OpenClaw sandbox mode)
+        apt-get install -y ca-certificates curl gnupg lsb-release
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+          https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+          | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        apt-get update -y
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        usermod -aG docker ubuntu
+        systemctl enable docker
+        systemctl start docker
+
+        # Install AWS CLI v2 (x86_64 - Lightsail is x86 only)
+        apt-get install -y unzip
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install
+        rm -rf /tmp/aws /tmp/awscliv2.zip
+        aws --version
+
+        # Configure AWS credentials for the ubuntu user
+        # Using IAM user keys (Lightsail limitation vs EC2 instance profile)
+        mkdir -p /home/ubuntu/.aws
+        cat > /home/ubuntu/.aws/credentials << 'CREDS'
+        [default]
+        aws_access_key_id = ${OpenClawAccessKey}
+        aws_secret_access_key = ${OpenClawAccessKey.SecretAccessKey}
+        CREDS
+        cat > /home/ubuntu/.aws/config << 'AWSCONFIG'
+        [default]
+        region = ${AWS::Region}
+        output = json
+        AWSCONFIG
+        chown -R ubuntu:ubuntu /home/ubuntu/.aws
+        chmod 600 /home/ubuntu/.aws/credentials
+        chmod 600 /home/ubuntu/.aws/config
+
+        # Verify Bedrock access before continuing
+        echo "Testing Bedrock connectivity..."
+        su - ubuntu -c "aws bedrock-runtime invoke-model \
+          --region ${AWS::Region} \
+          --model-id ${OpenClawModel} \
+          --body '{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"ping\"}]}],\"inferenceConfig\":{\"maxTokens\":10}}' \
+          --cli-binary-format raw-in-base64-out \
+          /tmp/bedrock-test.json && echo 'Bedrock OK' || echo 'Bedrock test failed - check model access'"
+
+        # Install OpenClaw via npm (x86_64 build will be selected automatically)
+        echo "Installing openclaw@${OpenClawVersion}..."
+        npm install -g openclaw@${OpenClawVersion}
+        which openclaw-gateway || { echo "openclaw-gateway binary not found after install"; exit 1; }
+
+        # Create OpenClaw config directory
+        mkdir -p /home/ubuntu/.openclaw
+        chown ubuntu:ubuntu /home/ubuntu/.openclaw
+
+        # Write initial openclaw.json
+        # Important: Bonjour (mDNS) is disabled here. It crashes in cloud environments
+        # because AWS VPC does not support multicast networking. This is the same fix
+        # applied in the EC2 version. Without it, the gateway crashes on startup.
+        cat > /home/ubuntu/.openclaw/openclaw.json << 'OCCONFIG'
+        {
+          "agents": {
+            "defaults": {
+              "model": {
+                "primary": "amazon-bedrock/${OpenClawModel}"
+              }
+            }
+          },
+          "gateway": {
+            "port": 18789
+          },
+          "plugins": {
+            "entries": {
+              "bonjour": {
+                "enabled": false
+              }
+            }
+          }
+        }
+        OCCONFIG
+        chown ubuntu:ubuntu /home/ubuntu/.openclaw/openclaw.json
+
+        # Create user systemd directory
+        mkdir -p /home/ubuntu/.config/systemd/user
+        chown -R ubuntu:ubuntu /home/ubuntu/.config
+
+        # Write the openclaw-gateway user-level systemd service
+        # Mirrors the EC2 version: runs as the ubuntu user, not root
+        GATEWAY_BIN=$(which openclaw-gateway)
+        cat > /home/ubuntu/.config/systemd/user/openclaw-gateway.service << SVCEOF
+        [Unit]
+        Description=OpenClaw Gateway (v${OpenClawVersion})
+        After=network.target
+
+        [Service]
+        Type=simple
+        ExecStart=${!GATEWAY_BIN}
+        Restart=on-failure
+        RestartSec=10
+        Environment=HOME=/home/ubuntu
+        Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+        [Install]
+        WantedBy=default.target
+        SVCEOF
+        chown ubuntu:ubuntu /home/ubuntu/.config/systemd/user/openclaw-gateway.service
+
+        # Enable lingering so the user service survives logout and reboots
+        loginctl enable-linger ubuntu
+
+        # Start the gateway as the ubuntu user
+        su - ubuntu -c "systemctl --user daemon-reload"
+        su - ubuntu -c "systemctl --user enable openclaw-gateway"
+        su - ubuntu -c "systemctl --user start openclaw-gateway"
+
+        # Wait for the gateway to initialize and begin listening on 18789
+        echo "Waiting for openclaw-gateway to start..."
+        for i in $(seq 1 18); do
+          sleep 10
+          if ss -tlnp | grep -q :18789; then
+            echo "Gateway is up on port 18789 (attempt ${!i}/18)"
+            break
+          fi
+          echo "Still waiting... attempt ${!i}/18"
+        done
+
+        # Check gateway is actually running
+        if ! ss -tlnp | grep -q :18789; then
+          echo "WARNING: Gateway did not start within 3 minutes. Check logs:"
+          su - ubuntu -c "journalctl --user -u openclaw-gateway.service -n 30 --no-pager" || true
+        fi
+
+        # Extract the gateway token from openclaw.json and store it in SSM
+        # The token is generated by OpenClaw on first run.
+        # If this fails, retrieve it manually (see Outputs.AltTokenRetrieval).
+        echo "Extracting gateway token..."
+        TOKEN=$(node -e "
+          try {
+            const fs = require('fs');
+            const cfg = JSON.parse(fs.readFileSync('/home/ubuntu/.openclaw/openclaw.json', 'utf8'));
+            const token = cfg.gateway && cfg.gateway.token;
+            console.log(token || 'token-not-yet-written');
+          } catch(e) {
+            console.log('token-read-error: ' + e.message);
+          }
+        " 2>/dev/null || echo "token-read-failed")
+
+        aws ssm put-parameter \
+          --name "/openclaw/${AWS::StackName}/gateway-token" \
+          --value "${!TOKEN}" \
+          --type "String" \
+          --overwrite \
+          --region ${AWS::Region} \
+          && echo "Gateway token stored in SSM: ${!TOKEN}" \
+          || echo "SSM write failed - retrieve token manually"
+
+        echo "=== Setup complete: $(date) ==="
+        echo ""
+        echo "Next steps:"
+        echo "  1. SSH: ssh -i your-key.pem ubuntu@<PUBLIC_IP>"
+        echo "  2. Port forward: ssh -i your-key.pem -L 18789:localhost:18789 -N ubuntu@<PUBLIC_IP>"
+        echo "  3. Open: http://localhost:18789"
+
+Outputs:
+
+  InstancePublicIp:
+    Description: "Public IP of the Lightsail instance"
+    Value: !GetAtt OpenClawInstance.PublicIpAddress
+
+  Step1ConnectSSH:
+    Description: "STEP 1 - Connect to the instance via SSH"
+    Value: !Sub "ssh -i ~/.ssh/your-lightsail-key.pem ubuntu@${OpenClawInstance.PublicIpAddress}"
+
+  Step1Alt:
+    Description: "STEP 1 (alt) - No key pair? Use browser SSH in the Lightsail console"
+    Value: !Sub "https://lightsail.aws.amazon.com/ls/webapp/${AWS::Region}/instances/${AWS::StackName}-openclaw/connect"
+
+  Step2PortForward:
+    Description: "STEP 2 - In a second terminal, start SSH port forwarding (keep it open)"
+    Value: !Sub "ssh -i ~/.ssh/your-lightsail-key.pem -L 18789:localhost:18789 -N ubuntu@${OpenClawInstance.PublicIpAddress}"
+
+  Step3Dashboard:
+    Description: "STEP 3 - Open the dashboard in your browser (once port forward is active)"
+    Value: "http://localhost:18789"
+
+  GatewayTokenCommand:
+    Description: "Retrieve the gateway token from SSM (~5 min after stack creation)"
+    Value: !Sub "aws ssm get-parameter --name /openclaw/${AWS::StackName}/gateway-token --query Parameter.Value --output text --region ${AWS::Region}"
+
+  AltTokenRetrieval:
+    Description: "If SSM fails, get the token directly on the instance"
+    Value: "node -e \"const fs=require('fs'); const c=JSON.parse(fs.readFileSync('/home/ubuntu/.openclaw/openclaw.json','utf8')); console.log(c.gateway.token)\""
+
+  CheckSetupProgress:
+    Description: "Monitor setup progress from inside the instance"
+    Value: "sudo tail -f /var/log/openclaw-setup.log"
+
+  GatewayStatus:
+    Description: "Check the gateway service status from inside the instance"
+    Value: "systemctl --user status openclaw-gateway.service"
