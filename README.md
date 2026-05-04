@@ -1,336 +1,381 @@
 # OpenClaw on AWS with Amazon Bedrock
 
-A self-hosted personal AI assistant running on AWS EC2, powered by Amazon Bedrock - no API keys, no local compute, no laptop dependency.
+A self-hosted personal AI assistant running on AWS EC2, powered by Amazon Bedrock. No separate API keys to manage, no laptop dependency, runs 24/7.
 
-Based on the guide by [Jon Bonso / The Cloud Dojo](https://www.linkedin.com/pulse/stop-running-openclaw-your-laptop-how-i-built-secure-personal-bonso-thyyc/).
+Based on the original guide by [Jon Bonso / The Cloud Dojo](https://www.linkedin.com/pulse/stop-running-openclaw-your-laptop-how-i-built-secure-personal-bonso-thyyc/).
 
 ---
 
 ## What This Is
 
-[OpenClaw](https://openclaw.ai) is an open-source AI agent framework. Instead of just chatting with an AI, it can take actions - respond to messages on WhatsApp/Telegram/Discord, run scheduled tasks, maintain memory across conversations, and use tools and skills.
+[OpenClaw](https://openclaw.ai) is an open-source AI agent framework. Unlike a simple chatbot, it can take actions - respond to messages on WhatsApp, Telegram, or Discord; run scheduled tasks; maintain memory across conversations; and use tools and skills.
 
 The problem with running it locally: it needs to be on 24/7, has full access to your machine, and dies when your laptop sleeps or your Wi-Fi drops.
 
-This deployment moves it to AWS, where it runs continuously on EC2 and calls Amazon Bedrock for its AI model instead of managing separate API keys per provider.
+This deployment moves it to AWS. It runs continuously on EC2 and calls Amazon Bedrock for the AI model, so you get a single unified API instead of juggling separate keys for each provider.
 
 ---
 
-## Repository Structure
+## Templates
 
-```
-.
-├── README.md
-└── cloudformation/
-    └── openclaw-bedrock.yaml
-```
+| Template | Description |
+|---|---|
+| [`cloudformation/openclaw-bedrock_v1_2.yaml`](cloudformation/openclaw-bedrock_v1_2.yaml) | EC2 in private subnet, NAT Gateway, SSM access, Bedrock via EC2 instance role |
+| [`cloudformation/openclaw-bedrock_v1_3.yaml`](cloudformation/openclaw-bedrock_v1_3.yaml) | v1.2 + dedicated IAM user for Bedrock, credentials in SSM Parameter Store, automated UserData bootstrap |
+
+Use v1.3 for new deployments. v1.2 is kept here for reference.
 
 ---
 
 ## Architecture
 
 ```
-Your Phone (WhatsApp/Telegram)
-        |
-        v
-  Messaging Platform
-        |
-        v
+Your Phone (WhatsApp / Telegram / Discord)
+            |
+            v
+    Messaging Platform
+            |
+            v
   OpenClaw Gateway (EC2 - Ubuntu 24.04, Graviton ARM64)
-        |
-        v
-  Amazon Bedrock (Nova Lite / Nova Micro)
-        |
-        v
-  AI Response
+  Private Subnet, no public IP
+  Access via SSM Session Manager only
+            |
+            v
+  Amazon Bedrock (Claude / Nova / Llama / DeepSeek)
 ```
 
-**Key components:**
+**Components:**
 
-- **EC2 Instance** - runs the OpenClaw gateway process (t4g.small, ARM64/Graviton)
-- **Amazon Bedrock** - provides the AI model via unified API, no separate API keys needed
-- **IAM Role** - EC2 authenticates to Bedrock via instance profile, no credentials stored anywhere
-- **EBS Data Volume** - 30GB encrypted volume for OpenClaw config and data, survives instance stop/start
-- **SSM Session Manager** - access to the instance and port forwarding, no SSH port open
-- **VPC** - dedicated network with optional private endpoints so traffic never leaves AWS
+- **EC2 instance** - runs the OpenClaw gateway process (t4g.small by default, ARM64/Graviton)
+- **Amazon Bedrock** - provides the AI model via a single unified AWS API
+- **Dedicated IAM user (v1.3)** - scoped to Bedrock invoke only; keys stored in SSM, injected into the OpenClaw process at boot
+- **EBS data volume** - 30GB encrypted gp3, separate from the root volume; persists config across instance stop/start
+- **NAT Gateway** - outbound internet for the private subnet (needed at boot to download Node.js and OpenClaw)
+- **VPC endpoints** (optional) - private connectivity to Bedrock, SSM, and EC2 Messages so traffic never leaves AWS
+- **SSM Session Manager** - primary access method; no SSH port open, no key pair required for day-to-day use
 
 ---
 
-## Why Bedrock Instead of Direct API Keys
+## Why v1.3 Uses a Dedicated IAM User (and Not the Instance Profile)
 
-| Feature | Standalone OpenClaw | OpenClaw + Bedrock |
-|---|---|---|
-| Setup | Manual CLI + Docker | 1-click CloudFormation |
-| AI Model Access | Separate API keys per provider | Single unified API |
-| Billing | Multiple bills (OpenAI, Anthropic, etc.) | Single AWS bill |
-| Security | API keys in local files | IAM Roles, no keys stored |
-| Networking | Public internet | Private VPC |
-| Reliability | Depends on laptop uptime | 99.99% AWS uptime |
+This is the non-obvious design decision, so it's worth documenting.
+
+The expected AWS-native pattern would be: attach an IAM role to the EC2 instance, let the instance profile deliver temporary credentials automatically via the metadata service (`169.254.169.254`). No static keys, no SSM, clean.
+
+The problem is OpenClaw runs on a library called `pi-coding-agent`, and **that library does not talk to the EC2 metadata service**. It only reads credentials from explicit environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). So even though the instance profile exists and the AWS CLI on the instance can use it fine, OpenClaw itself cannot.
+
+The workaround in v1.3:
+1. Create a dedicated IAM user scoped only to `bedrock:InvokeModel` and related actions
+2. CloudFormation generates the access key and stores it in SSM Parameter Store
+3. At boot, the UserData script uses the AWS CLI (which CAN use the metadata service) to fetch the keys from SSM
+4. The keys are written to `/home/ubuntu/.openclaw/aws-credentials.env` (loaded by systemd as an EnvironmentFile) and to OpenClaw's own `auth-profiles.json`
+5. The OpenClaw process reads the env vars directly - no metadata service needed
+
+Static IAM user keys do not expire, which is why no credential refresh mechanism is needed. The tradeoff is that static keys are less secure than temporary STS credentials. For a personal sandbox deployment this is acceptable; for a production environment, consider Secrets Manager and a credential rotation strategy.
+
+If you want to use IAM roles instead of a static IAM user, it's possible but requires a refresh script, because STS-issued temporary credentials expire in at most 12 hours and OpenClaw does not re-read them on its own.
+
+---
+
+## Prerequisites
+
+Before deploying, complete these steps in order. The deployment will succeed even if you skip some of them, but OpenClaw will silently fail to work.
+
+### 1. Enable Bedrock Model Access
+
+This is the step most people miss. Your AWS account does not have access to Bedrock models by default - you have to explicitly request it.
+
+1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock)
+2. Go to **Model access** in the left sidebar
+3. Find the model you plan to use (e.g. Amazon Nova, Anthropic Claude, Meta Llama)
+4. Click **Manage model access** and enable it
+5. For Anthropic models specifically, you need to fill out a short use case form - approval is usually instant but required
+
+Do this before running the CloudFormation stack. If you skip it, the stack will deploy successfully, the gateway will start, and you will get no response when you try to chat. There is no error message - it just does nothing.
+
+### 2. Install the SSM Session Manager Plugin
+
+You need this on your local machine to run port forwarding. Without it, you cannot access the OpenClaw dashboard in your browser.
+
+Follow the [AWS installation guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) for your OS.
+
+### 3. Create an EC2 Key Pair (Optional but Recommended)
+
+The template uses SSM Session Manager as the primary access method, so a key pair is not strictly required. But you should have one if you ever need emergency SSH access or want to troubleshoot outside of SSM.
+
+To create one:
+
+1. Go to the [EC2 console](https://console.aws.amazon.com/ec2) in your target region
+2. Navigate to **Network & Security > Key Pairs**
+3. Click **Create key pair**
+4. Give it a name (e.g. `openclaw-key`), choose RSA, format `.pem`
+5. Download and store the `.pem` file somewhere safe (e.g. `~/.ssh/`)
+6. Run `chmod 400 ~/.ssh/openclaw-key.pem`
+
+When deploying the CloudFormation stack, enter this key pair name in the `KeyPairName` parameter. The key pair name is case-sensitive - if it doesn't match exactly what you typed in the EC2 console, CloudFormation will fail.
+
+### 4. Choose Your Region and Model
+
+Not all Bedrock models are available in all regions. For regions outside `us-east-1` and `us-west-2`, bare model IDs are often rejected - you need to use inference profile IDs with a regional prefix.
+
+Check what's available in your target region:
+
+```bash
+aws bedrock list-inference-profiles --region YOUR_REGION
+```
+
+Examples of correct inference profile IDs by region:
+
+| Region | Profile format |
+|---|---|
+| us-east-1 / us-west-2 | `us.amazon.nova-lite-v1:0` |
+| ap-northeast-1 (Tokyo) | `ap.amazon.nova-lite-v1:0` |
+| eu-central-1 | `eu.amazon.nova-lite-v1:0` |
+| Global (cross-region) | `global.amazon.nova-2-lite-v1:0` |
+
+If you select a model that your region doesn't support, the deployment will succeed but the AI will not respond.
 
 ---
 
 ## Deployment
 
-### Prerequisites
+### Deploy the Stack
 
-- AWS account with Bedrock model access enabled
-- AWS CLI installed and configured locally
-- SSM Session Manager plugin installed locally
+1. Download [`cloudformation/openclaw-bedrock_v1_3.yaml`](cloudformation/openclaw-bedrock_v1_3.yaml)
 
-### Step 1: Enable Bedrock Model Access
+2. Open the [CloudFormation console](https://console.aws.amazon.com/cloudformation) in your target region
 
-Before deploying, go to **AWS Console > Bedrock > Model access** and enable the models you want. The default is Amazon Nova Lite. This step is not in the original guide but the deployment will silently fail without it - the stack completes successfully but the AI never responds.
+3. Click **Create stack > With new resources**
 
-### Step 2: Create an EC2 Key Pair
+4. Upload the template file
 
-The key pair gives you emergency SSH access to the instance if SSM is ever unavailable. It is optional but recommended.
+5. Fill in parameters:
 
-1. Go to **AWS Console > EC2**
-2. In the left sidebar, scroll down to **Network & Security > Key Pairs**
-3. Click **Create key pair** (orange button, top right)
-4. Fill in the details:
-   - **Name:** anything you'll remember, e.g. `openclaw-key` (no spaces, case-sensitive - you'll need to type this exactly later)
-   - **Key pair type:** RSA
-   - **Private key file format:** .pem
-5. Click **Create key pair**
+| Parameter | Recommended setting |
+|---|---|
+| `OpenClawModel` | Choose a model available in your region (see above) |
+| `OpenClawVersion` | `2026.3.24` - stable and tested; do not use `latest` |
+| `InstanceType` | `t4g.small` for personal use; Graviton (ARM) is 20-40% cheaper |
+| `KeyPairName` | Your key pair name, or leave `none` if not using SSH |
+| `CreateVPCEndpoints` | `false` for sandbox (saves ~$29/month); `true` for production |
+| `EnableDataProtection` | `false` for sandbox; `true` if you want to retain data on stack delete |
 
-A `.pem` file downloads automatically. Keep it somewhere safe, e.g. Parameter Store.
+6. Click through to **Create stack**
 
-### Step 3: Deploy via CloudFormation
+7. Wait for the stack to reach `CREATE_COMPLETE` - this takes 10-20 minutes because CloudFormation waits for the OpenClaw gateway to finish starting up
 
-Use the template in [`cloudformation/openclaw-bedrock.yaml`](cloudformation/openclaw-bedrock.yaml) or from [aws-samples/sample-OpenClaw-on-AWS-with-Bedrock](https://github.com/aws-samples/sample-OpenClaw-on-AWS-with-Bedrock).
+### Connect to the Dashboard
 
-Key parameters to configure:
+Once the stack is complete, go to the **Outputs** tab and follow the steps there:
 
-| Parameter | Recommended (Sandbox) | Notes |
-|---|---|---|
-| OpenClawModel | `global.amazon.nova-2-lite-v1:0` | Cheapest, good for everyday tasks |
-| OpenClawVersion | `2026.3.24` | More stable, no extra approval needed |
-| InstanceType | `t4g.small` | ARM64 Graviton, cheapest viable option |
-| KeyPairName | `openclaw-key` | Must match the key pair name from Step 2 exactly - it is case-sensitive |
-| CreateVPCEndpoints | `false` | Saves ~$29/month for sandbox use |
-| EnableDataProtection | `false` | Set to `true` for production |
+**Step 1:** Install the SSM Session Manager plugin (if you haven't already)
 
-Scroll to the bottom, check **"I acknowledge that AWS CloudFormation might create IAM resources"**, and click **Create stack**.
-
-Wait ~8-10 minutes for `CREATE_COMPLETE`.
-
-### Step 4: Fix the Bonjour Plugin Bug
-
-**Do this before anything else.** This is a critical issue when running OpenClaw on AWS that the original guide does not mention.
-
-The `bonjour` plugin handles local network discovery and requires multicast networking, which AWS VPC does not support. It crashes the gateway every ~45 seconds, putting it in a permanent crash loop. The service will appear to start successfully but port 18789 will never stay open long enough to accept connections.
-
-Connect to the instance via SSM:
-
-```bash
-aws ssm start-session --target <instance-id> --region <region>
-sudo su - ubuntu
-```
-
-Disable the bonjour plugin:
-
-```bash
-# Back up config first
-cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak
-
-python3 -c "
-import json
-with open('/home/ubuntu/.openclaw/openclaw.json', 'r') as f:
-    config = json.load(f)
-if 'plugins' not in config:
-    config['plugins'] = {}
-if 'entries' not in config['plugins']:
-    config['plugins']['entries'] = {}
-config['plugins']['entries']['bonjour'] = {'enabled': False}
-with open('/home/ubuntu/.openclaw/openclaw.json', 'w') as f:
-    json.dump(config, f, indent=2)
-print('Done')
-"
-```
-
-Verify the change:
-
-```bash
-cat ~/.openclaw/openclaw.json | python3 -m json.tool | grep -A3 bonjour
-```
-
-Restart the gateway and confirm it stays up:
-
-```bash
-systemctl --user restart openclaw-gateway.service
-sleep 15
-ss -tlnp | grep 18789
-```
-
-You should see port 18789 in LISTEN state. If it is there after 15 seconds, the fix worked.
-
-### Step 5: Access the Dashboard
-
-The CloudFormation Outputs tab gives you everything you need under Steps 1-4.
-
-**Port forwarding** - run on your local machine and keep the terminal open:
+**Step 2:** Run the port forwarding command from the Outputs. It looks like this:
 
 ```bash
 aws ssm start-session \
-  --target <instance-id> \
-  --region <region> \
+  --target i-0abc123def456789 \
+  --region ap-northeast-1 \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["18789"],"localPortNumber":["18789"]}'
 ```
 
-Then open the URL from the `Step3AccessURL` output in your browser. The token is already embedded in the URL.
+Keep this terminal open. It's the tunnel.
 
-**If you ever lose the token**, retrieve it from SSM Parameter Store:
+**Step 3:** Open the URL from the Outputs in your browser:
 
-```bash
-aws ssm get-parameter \
-  --name "/openclaw/<stack-name>/gateway-token" \
-  --with-decryption \
-  --region <region> \
-  --query Parameter.Value \
-  --output text
+```
+http://localhost:18789/?token=<your-token>
 ```
 
-### Step 6: Connect a Messaging Channel
-
-Once the dashboard is up, go to **Channels > Add Channel** and connect Telegram, WhatsApp, Discord, or Slack. The assistant will walk you through setup on first conversation.
+**Step 4:** Connect a messaging channel (WhatsApp, Telegram, Discord, Slack) via the dashboard.
 
 ---
 
-## Estimated Cost
+## Estimated Monthly Cost
 
-| Resource | Monthly Cost |
+| Resource | Cost |
 |---|---|
 | EC2 t4g.small | ~$12-15 |
 | EBS 30GB gp3 | ~$2.40 |
-| VPC Endpoints (if enabled) | ~$29 |
-| Bedrock | Pay per token used |
-| **Total (no endpoints)** | **~$15-20/month** |
+| NAT Gateway | ~$32-45 |
+| VPC Endpoints (5 endpoints, if enabled) | ~$29 |
+| Bedrock | Pay per token |
+| **Total without endpoints** | **~$46-62/month** |
+| **Total with endpoints** | **~$75-90/month** |
 
-For sandbox use, keep `CreateVPCEndpoints=false`. For production, enable them so your traffic stays private within AWS.
+The NAT Gateway is the biggest fixed cost. It's needed at boot for the instance to download Node.js and OpenClaw from the internet. After setup, you could theoretically remove it if you only use VPC endpoints - but this makes the stack more complex to manage.
 
-**Tip:** Stop the EC2 instance when not in use. Your config persists on the separate EBS data volume. You only pay for EBS storage while stopped, not compute.
+To save cost on a sandbox deployment: set `CreateVPCEndpoints=false` and use `t4g.small`.
+
+---
+
+## Things the Original Guide Does Not Tell You
+
+These are hard-won findings from deploying and debugging this setup from scratch.
+
+**1. Enable Bedrock model access before you deploy**
+
+If you skip this, the stack creates fine, OpenClaw starts, and there is no error message - the AI just does not respond. Go to Bedrock > Model access and enable it first.
+
+**2. Disable the bonjour plugin immediately after setup**
+
+The bonjour plugin crashes the OpenClaw gateway every ~45 seconds in any cloud environment. The symptom is the gateway repeatedly dying and restarting.
+
+Check if this is happening:
+
+```bash
+journalctl --user -u openclaw-gateway.service -n 50 --no-pager
+```
+
+If you see repeated restarts with socket/network errors, bonjour is the cause. Disable it:
+
+```bash
+# SSH into the instance or use SSM
+cat ~/.openclaw/openclaw.json
+```
+
+The config needs this section:
+
+```json
+"plugins": {
+  "entries": {
+    "bonjour": {
+      "enabled": false
+    }
+  }
+}
+```
+
+Then restart the service:
+
+```bash
+systemctl --user restart openclaw-gateway.service
+```
+
+**3. Do not click the update banner in the OpenClaw dashboard**
+
+In-place updates can overwrite or break the config file the CloudFormation template set up. If you want to update, redeploy the stack with a new version.
+
+**4. Bedrock has daily token quotas on new accounts**
+
+If the AI stops responding and there are no obvious errors, check your Bedrock quota in the AWS console under Service Quotas > Amazon Bedrock. You can also test Bedrock directly from the instance to isolate the issue:
+
+```bash
+aws bedrock-runtime invoke-model \
+  --model-id amazon.nova-lite-v1:0 \
+  --body '{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"inferenceConfig":{"max_new_tokens":100}}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/bedrock-test.json && cat /tmp/bedrock-test.json
+```
+
+If this returns a response, Bedrock is working and the issue is in OpenClaw's config or credential setup.
+
+**5. Some regions reject bare model IDs - use inference profile IDs**
+
+In regions like Tokyo (`ap-northeast-1`), a model ID like `amazon.nova-lite-v1:0` gets rejected. You must use the regional inference profile like `ap.amazon.nova-lite-v1:0`.
+
+To list what's available in your region:
+
+```bash
+aws bedrock list-inference-profiles --region YOUR_REGION
+```
+
+**6. Key pair name is case-sensitive**
+
+If you enter a key pair name that doesn't exactly match what you created in EC2 (including capitalization), CloudFormation will fail at the EC2 instance resource. Double-check the exact name in the EC2 console.
+
+**7. The gateway token is in SSM - you do not need to save the URL**
+
+The access token for the dashboard is stored in SSM Parameter Store at:
+
+```
+/openclaw/<stack-name>/gateway-token
+```
+
+To retrieve it if you lose the URL:
+
+```bash
+aws ssm get-parameter \
+  --name /openclaw/YOUR_STACK_NAME/gateway-token \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text \
+  --region YOUR_REGION
+```
+
+**8. Stopping the EC2 instance is safe**
+
+Config and data live on the separate 30GB EBS volume (`/dev/sdf`), not on the root volume. You can stop the instance to save cost when not using it. The gateway token persists in SSM as well.
 
 ---
 
 ## Troubleshooting
 
-### Gateway crash loop - bonjour plugin
+### Stack creation fails or times out
 
-**Symptom:** SSM port forwarding connects but immediately shows `Connection to destination port failed`. The gateway appears to start but dies after ~45 seconds.
+The CloudFormation WaitCondition gives the setup script 20 minutes to complete. If it times out, the most likely cause is one of:
 
-**Diagnosis:** Check the journal logs:
+- Node.js or OpenClaw failed to download (transient network issue - try redeploying)
+- The OpenClaw gateway didn't start within 4 minutes
 
-```bash
-journalctl --user -u openclaw-gateway.service --since "5 minutes ago" --no-pager
-```
-
-If you see this repeating:
-
-```
-[openclaw] Unhandled promise rejection: CIAO PROBING CANCELLED
-openclaw-gateway.service: Main process exited, code=exited, status=1/FAILURE
-```
-
-That is the bonjour crash. Apply the fix in Step 4 above.
-
-**Root cause:** Bonjour (mDNS) requires multicast networking for local device discovery. AWS VPC does not support multicast. The plugin gets stuck in a probing loop, gives up, and throws an unhandled rejection that kills the entire Node.js process. It restarts via systemd and crashes again on a ~45 second cycle indefinitely.
-
----
-
-### AI not responding in the dashboard
-
-**Symptom:** Messages send successfully in the UI but no response comes back.
-
-**Diagnosis:** Test Bedrock connectivity directly from the EC2 instance:
+To see exactly what happened:
 
 ```bash
-MODEL_ID="global.amazon.nova-2-lite-v1:0"
+# SSM into the instance after the stack fails
+aws ssm start-session --target INSTANCE_ID --region YOUR_REGION
+
+# Then on the instance:
+sudo tail -100 /var/log/openclaw-setup.log
+```
+
+### Gateway crashes in a loop
+
+```bash
+journalctl --user -u openclaw-gateway.service -n 100 --no-pager
+```
+
+Look for repeated restart entries. Most commonly caused by the bonjour plugin (see the gotchas section above).
+
+### OpenClaw responds but Bedrock calls fail
+
+```bash
+# Check the credentials env file was written correctly
+cat /home/ubuntu/.openclaw/aws-credentials.env
+
+# Test Bedrock directly with the AWS CLI
 aws bedrock-runtime invoke-model \
-  --region <region> \
-  --model-id "$MODEL_ID" \
-  --body '{"messages":[{"role":"user","content":[{"text":"say hello"}]}],"inferenceConfig":{"maxTokens":100}}' \
+  --model-id YOUR_MODEL_ID \
+  --region YOUR_REGION \
+  --body '{"messages":[{"role":"user","content":[{"type":"text","text":"test"}]}],"inferenceConfig":{"max_new_tokens":50}}' \
   --cli-binary-format raw-in-base64-out \
-  /tmp/bedrock-test.json && cat /tmp/bedrock-test.json
+  /tmp/test-out.json && cat /tmp/test-out.json
 ```
 
-**If you get `ThrottlingException: Too many tokens per day`:**
+If the AWS CLI call works but OpenClaw doesn't, the issue is in how credentials are being passed to the OpenClaw process. Check the env file and `auth-profiles.json`.
 
-You have hit your daily Bedrock token quota. This is common on new AWS accounts with default limits. Options:
+### Port forwarding disconnects
 
-1. Wait for the quota to reset (midnight UTC daily)
-2. Request a quota increase: AWS Console > Service Quotas > Amazon Bedrock
-3. Try a different model - first check what inference profiles are available in your region:
-
-```bash
-aws bedrock list-inference-profiles --region <region> \
-  --query "inferenceProfileSummaries[].inferenceProfileId" \
-  --output table
-```
-
-Note: in some regions like Tokyo (`ap-northeast-1`), bare model IDs are rejected. You must use inference profile IDs with a regional prefix (e.g. `apac.amazon.nova-micro-v1:0`).
-
-If an alternative model works, update openclaw.json to use it:
-
-```bash
-python3 -c "
-import json
-with open('/home/ubuntu/.openclaw/openclaw.json', 'r') as f:
-    config = json.load(f)
-config['agents']['defaults']['model']['primary'] = 'amazon-bedrock/<new-model-id>'
-with open('/home/ubuntu/.openclaw/openclaw.json', 'w') as f:
-    json.dump(config, f, indent=2)
-print('Done')
-"
-systemctl --user restart openclaw-gateway.service
-```
-
-**If you get `ResourceNotFoundException` for Claude models:**
-
-Anthropic models on AWS require a one-time use case form per account. Go to AWS Console > Bedrock > Model access, find the Anthropic section, and fill out the form. It typically activates within 15 minutes.
+The SSM session will time out after 20 minutes of inactivity by default. Just re-run the port forwarding command from the Outputs tab.
 
 ---
 
-### Port forwarding fails after reconnecting
+## Version History
 
-**Symptom:** You previously had the dashboard working, closed the terminal, and now reconnecting gives `Connection to destination port failed`.
+**v1.3 (current)**
+- Dedicated IAM user created for Bedrock access, scoped to `InvokeModel` only
+- Access key and secret stored in SSM Parameter Store
+- UserData fetches credentials from SSM at boot and writes them to the systemd EnvironmentFile and OpenClaw's `auth-profiles.json`
+- `AWS_REGION` added to systemd service environment
+- Default model changed to `global.anthropic.claude-sonnet-4-6`
+- EC2 instance now depends on SSM parameters being written before boot
 
-**Check if the gateway is still running:**
-
-```bash
-ss -tlnp | grep 18789
-```
-
-If nothing shows, the gateway crashed. Check the logs and restart:
-
-```bash
-journalctl --user -u openclaw-gateway.service -n 30 --no-pager
-systemctl --user restart openclaw-gateway.service
-sleep 15
-ss -tlnp | grep 18789
-```
-
-Then kill and re-run the port forwarding command on your local machine.
-
----
-
-### Do not click the update banner
-
-OpenClaw shows an update available banner when a newer version exists. Do not click it. The CloudFormation template configures a specific version and the config format differs between versions. Updating in-place breaks the existing configuration. If you want to upgrade, redeploy the stack with the new version parameter instead.
-
----
-
-## Things the Original Guide Doesn't Tell You
-
-1. **Enable Bedrock model access first** - the deployment completes successfully but the AI silently fails to respond
-2. **The key pair name is case-sensitive** - if it doesn't match exactly what you typed in EC2, CloudFormation will fail
-3. **Disable the bonjour plugin immediately** - it will crash your gateway every 45 seconds in any cloud environment
-4. **Don't click the update banner** - updating in-place can break the config the CloudFormation template set up
-5. **Bedrock has daily token quotas on new accounts** - test Bedrock directly with `aws bedrock-runtime invoke-model` to confirm whether it is a quota issue
-6. **In some regions (e.g. Tokyo), bare model IDs are rejected** - use inference profile IDs with a regional prefix and check with `aws bedrock list-inference-profiles`
-7. **The gateway token lives in SSM Parameter Store** at `/openclaw/<stack-name>/gateway-token` - you do not need to save the dashboard URL separately
-8. **Stopping the EC2 instance is safe** - config persists on the separate EBS data volume
+**v1.2**
+- EC2 instance moved to private subnet (no public IP)
+- NAT Gateway added to public subnet for outbound internet during setup
+- Private route table with default route via NAT Gateway
+- Access via SSM Session Manager only (no SSH required)
+- Bedrock access via EC2 instance role directly
 
 ---
 
