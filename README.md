@@ -30,7 +30,7 @@ Use v1.3 for new deployments. v1.2 is kept here for reference.
 ## Architecture
 
 ```
-Your Phone (WhatsApp / Telegram / Discord)
+Your Phone (Line / Telegram / Discord / Slack)
             |
             v
     Messaging Platform
@@ -188,7 +188,7 @@ Keep this terminal open. It's the tunnel.
 http://localhost:18789/?token=<your-token>
 ```
 
-**Step 4:** Connect a messaging channel (WhatsApp, Telegram, Discord, Slack) via the dashboard.
+**Step 4:** Connect a messaging channel (WhatsApp, Line, Telegram, Discord, Slack) via the dashboard.
 
 ---
 
