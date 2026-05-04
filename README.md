@@ -358,6 +358,10 @@ If the AWS CLI call works but OpenClaw doesn't, the issue is in how credentials 
 
 The SSM session will time out after 20 minutes of inactivity by default. Just re-run the port forwarding command from the Outputs tab.
 
+
+## Demo
+[Watch Demo: Chatting with OpenClaw via Line](https://1drv.ms/v/c/060d23632df8ec38/IQC0GsULKl5vQbGlm-2_u-9PAck-id9kjbPjb610SKa0Fb0?e=UKhza7)
+
 ---
 
 ## Version History
